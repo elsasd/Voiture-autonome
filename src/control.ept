@@ -1,0 +1,169 @@
+open Globals
+open Utilities
+
+const distanceMaxAvecPieton : int = 50
+const kp : float = 0.400 *. (2.0/.3.0) 
+const dt : float = 0.05
+const ki : float = 0.01 
+const kd : float = 6.0 
+const marge_erreur_const_regu : float = 5.0
+const tempsAttenteFaible : float = 20.0
+const tempsAttenteMoyenne : float = 25.0
+const tempsAttenteForte : float = 55.0
+
+(* Calcule le temps necessaire pour sortir de la zone verte en fonction du param de Go. *)
+node count_goal(iti: itielts; step : int) returns (o : float)
+let
+  o = if (((iti[>step<]).act) = Go) and(((iti[>step<]).param) <=. 20.0) then 
+  (
+    if(((iti[>step<]).param) <=. 10.0) then
+    tempsAttenteForte else 
+    tempsAttenteMoyenne
+  ) else 
+  tempsAttenteFaible;
+tel
+
+(* Calcul de la trajectoire pour le suivit de ligne. *)
+node deriv(x, dt : float) returns (dx : float)
+let
+  dx = 0.0 -> ((x -. pre x) /. dt);
+tel
+
+node pid(kp, ki, kd, error, dt, lastError : float) returns (y : float)
+let
+  y = kp*.(error) +. 
+      ki*.integrator(error, dt, lastError) +. 
+      kd*.deriv(error, dt); 
+tel
+
+(* Definit l'erreur selon la couleur vue, enregistre cette derniere et appelle la donction pid. *)
+node correction(sens : sensors) returns (turn : float)
+var lightValue, lastError: float;
+let
+  lightValue = if compare_colors(sens.s_road, green) >. 0.70 then 
+    0.0 else  Mathext.float(Utilities.max_int(
+    sens.s_road.green, 
+    sens.s_road.red
+    ));
+  lastError = 0.0 fby lightValue;
+  turn = pid(kp, ki, kd, lightValue, dt, lastError);   
+tel
+
+(* Les differentes fonctions verifiant les transitions. *)
+node stop(iti :itielts; step : int) returns (stop : bool)
+let
+  stop = if ((iti[>step<]).act = Stop) then true else false;
+tel
+
+node turn(iti :itielts; step : int) returns (stop : bool)
+let
+  stop = if ((iti[>step<]).act = Turn) then true else false;
+tel
+
+node go(iti :itielts; step : int) returns (stop : bool)
+let
+  stop = if ((iti[>step<]).act = Go) then true else false;
+tel
+
+node trafic_lights(sens : sensors) returns (stop : bool)
+let
+  stop = if (decode_color(sens.s_front) = Red) then true else false;
+tel
+
+node pieton(sens : sensors)
+      returns (o : bool)
+let
+  o = if (sens.s_sonar < distanceMaxAvecPieton) then true else false;
+tel
+
+node see_green(sens : sensors)
+      returns (o : bool)
+let
+  o = compare_colors(green, sens.s_road) = 1.0;
+tel
+
+(* Calculs pour le Turn *)
+node timeToTurn (angle : float; vitesse : float) returns (o : float)
+      var arc_length : float;
+let
+  arc_length = (angle /. 360.0) *. (pi *. cD);
+  o = ((arc_length) /. (vitesse));
+
+tel
+
+(* Ramene la vitesse calculÃ©e a une vitesse en dessous de la vitesse maximale. *)
+node regulateur_vitesse (vitesse_etablie, vitesse: float) returns (vitesse_regule : float)
+    var const_regu, const_regu_a_soustraire : float;
+    let
+      (* Ici on ajoute une marge d'erreur pour etre sur d'exclure la vitesse maximale. *)
+      const_regu = ((vitesse_etablie *. 100.0) /. vitesse)+. marge_erreur_const_regu;
+      const_regu_a_soustraire = if (const_regu >. 100.0) then const_regu -. 100.0 else 0.0;
+      vitesse_regule = vitesse_etablie -. const_regu_a_soustraire;
+    tel
+
+(* Definit la vitesse des roues selon notre position sur la ligne et la couleur col. *)
+node vitesse_roue(sens: sensors; pid : float; vitesse : float; col : color)
+      returns (o: float)
+      var pre_traitement : float;
+let 
+  pre_traitement = if (not (compare_colors(col, sens.s_road) = 0.0)) and 
+  (not (compare_colors(green, sens.s_road) = 1.0)) and 
+  (not (compare_colors(blue, sens.s_road) = 1.0)) then 
+  vitesse +. pid else 
+  vitesse -. pid;
+  o = regulateur_vitesse(pre_traitement, vitesse);
+tel
+
+(* Fonction principale. *)
+node controller(sens : sensors; iti : itielts)
+      returns (rspeed : wheels; arriving : bool)
+      var last vitesse : float;
+      last step : int = 0;
+let
+  automaton
+    state Pid
+      do 
+        vitesse = (((iti[>step<]).param-.1.0) *. 360.0) /. (pi *. cD);
+        rspeed = { left = (vitesse_roue(sens, correction(sens), vitesse, green)) ; 
+        right = (vitesse_roue(sens, correction(sens), vitesse, red))};
+        arriving = false;
+      unless (see_green(sens)) then AddStep | (trafic_lights(sens)) then Stop | pieton(sens) then Stop
+
+    state AddStep
+      do 
+        step = last step + 1; 
+        rspeed = { left = vitesse; right = vitesse};
+        arriving = false;
+      until (stop(iti, step)) then Stop | (turn(iti, step)) then Turn | go(iti, step) then GoStraight
+
+    state GoStraight 
+    var count: float;
+      do
+        count = 0.0 fby count +. 1.0;
+        vitesse = (((iti[>step<]).param-.1.0 )*. 360.0) /. (pi *. cD); 
+        rspeed = {left = abs((vitesse_roue(sens, correction(sens), vitesse, green))); 
+                  right = abs((vitesse_roue(sens, correction(sens), vitesse, red)))};
+        arriving = false;
+        until (count >. count_goal(iti, step)) and (go(iti, step)) then Pid | 
+        (count >. count_goal(iti, step)) and (turn(iti, step)) then AddStep
+
+    state Stop
+      do
+        vitesse = 0.0;
+        rspeed = { left = 0.0; right = 0.0};
+        arriving = if (stop(iti, step)) then true else false;
+      until not pieton(sens) then Pid | not trafic_lights(sens) then Pid
+
+    state Turn
+      var cpt: int;
+      time, constante_virage: float;
+      do
+        cpt = 1 + (0 fby cpt);
+        time = timestep *. Mathext.float(cpt);
+        constante_virage = if ((iti[>step<]).param <. 0.0) then -.1.0 else 1.0; (*constante qui permet de changer le sens du Turn*)
+        rspeed = { left = -.vitesse *. constante_virage; right = vitesse *. constante_virage };
+        arriving = false;
+      until (time >. timeToTurn((iti[>step<]).param*.constante_virage, (iti[>step -1<]).param)) then GoStraight
+
+  end
+tel
